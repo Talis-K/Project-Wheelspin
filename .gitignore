@@ -1,0 +1,33 @@
+# --- MATLAB ---
+*.asv
+*.m~
+*.autosave
+*.mex*
+*.mat.bak
+
+# --- Simulink ---
+slprj/
+sccprj/
+*.slxc
+*.slx.autosave
+*.mdl.autosave
+*.slx.original
+*.mdl.original
+*.slx.r*
+*.mdl.r*
+
+# --- Generated / build output ---
+codegen/
+*_ert_rtw/
+*_grt_rtw/
+*_sfun*/
+*.c.bak
+
+# --- Simulink Project internals ---
+resources/
+.SimulinkProject/
+
+# --- OS clutter ---
+.DS_Store
+Thumbs.db
+desktop.ini
