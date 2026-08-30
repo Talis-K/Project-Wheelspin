@@ -4,6 +4,12 @@
 % Accompanying notes: parameters.md
 %
 % Units: SI unless noted. NaN = unknown / TBC. Choose winding & cooling below.
+%
+% Cross-checked 2026-08-25 against project docs "EMRAX 208.docx" and
+% "VehicleSpecSheet2025.pdf". All Section 1 motor values matched the
+% datasheet exactly -- no corrections needed there. New lines pulled from
+% the vehicle spec sheet are tagged [SPEC SHEET]; a couple of flags are
+% called out inline where the source data is stale or ambiguous.
 
 clearvars; close all; clc;
 
@@ -13,6 +19,13 @@ clearvars; close all; clc;
 winding_type  = "HV";   % "HV" | "MV" | "LV"  — TBC for our car
 cooling_type  = "liquid"; % "air" | "liquid" | "combined" — TBC
 gear_ratio_i  = 3.5;    % primary reduction i; options for reflected inertia: 3, 3.5, 4, 4.5
+% >>> FLAG: this default is just one of the datasheet's example table
+% points, not a confirmed ratio for this car. VehicleSpecSheet2025.pdf
+% lists a 6:1 final drive via triplex chain, but that sheet describes
+% LAST YEAR's car (EMRAX 228, not this year's EMRAX 208) -- don't assume
+% it carries over. See final_drive_ratio_specsheet in Section 4 below.
+% Confirm the real ratio by counting sprocket teeth before trusting either
+% number.
 
 %% =========================================================================
 % 1. ACTUATOR — EMRAX 208 torque & power production
@@ -22,6 +35,27 @@ T_pk   = 150;           % [Nm] peak shaft torque (datasheet)
 P_pk   = 86e3;          % [W]  peak shaft power (datasheet overview)
 omega_max_rpm = 7000;   % [rpm] limiting speed
 omega_max = omega_max_rpm * (2*pi/60); % [rad/s]
+
+T_hard_limit = 80;      % [Nm] hard torque limit -- TEAM-INFORMED, not from the
+                         %      EMRAX datasheet. Source/reason (competition rule,
+                         %      safety margin, or a hardware constraint) not yet
+                         %      confirmed -- follow up and update this comment
+                         %      once known. Applied in driveline_dynamics.m as a
+                         %      final clamp on commanded torque.
+
+% Peak torque vs motor speed, simplified to 3 points read off the EMRAX
+% 208HV LC datasheet chart's "Peak torque" curve: flat up to base speed,
+% then tapering to top speed. Used in driveline_dynamics.m via
+% motor_peak_torque.m for acceleration-test runs (short duration, so the
+% continuous/thermal limits above don't apply -- peak capability is what
+% matters).
+% >>> FLAG: the flat portion here (90 Nm) is well below T_pk = 150 Nm
+% above. Worth double-checking against the datasheet chart -- it's a
+% dual-axis plot (power on the left 0-100 kW, torque on the right
+% 0-170 Nm), and it's easy to read a line against the wrong axis. If 90
+% turns out to be a misread, update the two values below.
+torque_curve_rpm = [0, 4500, 7000];   % [rpm] breakpoints
+torque_curve_Nm  = [90, 90, 70];      % [Nm]  peak torque at each breakpoint
 
 % Continuous torque by cooling [Nm]: air / liquid / combined
 T_cont_air = 54; T_cont_liq = 84; T_cont_comb = 90;
@@ -80,6 +114,22 @@ I_inv_cont = NaN;       % [A] inverter continuous current — TBC
 % I_pk_eff   = min(I_pk,   I_inv_pk);
 % I_cont_eff = min(I_cont, I_inv_cont);
 
+% Inverter identity/power ratings, assumed carried over unchanged from
+% last year's build per team confirmation -- current limits above are
+% still not published, only the power figures below are documented.
+inverter_model  = "Cascadia PM150DZ"; % [SPEC SHEET -- confirmed same unit still fitted]
+P_inv_disc_pk   = 85e3;   % [W] inverter peak discharge, ~1 s [SPEC SHEET -- source PDF's
+                           %      label/value columns were misaligned on extraction,
+                           %      re-check against the original document]
+P_inv_disc_cont = 64e3;   % [W] inverter continuous discharge [SPEC SHEET, same caveat]
+
+% Pack-level data (doesn't replace V_OC/R_int above, which are dynamic
+% under-load quantities that still need measuring).
+V_pack_nom  = 504;         % [V] pack nominal voltage, fully charged      [SPEC SHEET]
+E_pack_kWh  = 6.9;          % [kWh] accumulator energy                    [SPEC SHEET]
+cell_config = "120S4P";     % cell configuration                          [SPEC SHEET]
+cell_type   = "Samsung INR21700 40T"; % cell part number                 [SPEC SHEET]
+
 %% =========================================================================
 % 3. MECHANICAL, TEMPERATURE & MOTOR SENSING
 % =========================================================================
@@ -99,7 +149,11 @@ m_m_min = 9.4; m_m_max = 10.3;
 
 T_lim_wind = 100;       % [°C] winding sensor derate start
 T_lim_rotor = 100;      % [°C] rotor surface limit
-sensor_type = "";       % "resolver" | "encoder" — fitted type TBC
+sensor_type = "";       % "resolver" | "encoder" — fitted type TBC.
+                         % Last year's spec sheet lists "Resolver" for the
+                         % EMRAX 228 build -- plausible this carries over
+                         % since EMRAX ships resolver as standard, but NOT
+                         % confirmed for this year's EMRAX 208. [SPEC SHEET, unconfirmed]
 omega_m = NaN;          % [rad/s] motor rotor speed (from resolver/encoder) — runtime
 T_wind  = NaN;          % [°C] winding temperature — runtime / TBD sensor mapping
 
@@ -112,26 +166,60 @@ eta_g = NaN;            % [-] gearbox efficiency — TBD
 J_g   = NaN;            % [kg·m^2] gearbox inertia (motor-referred or axle — define) — TBD
 T_shaft_max = NaN;      % [Nm] shaft/CV torque rating — TBD
 
+% Chain, differential and half-shaft identity/geometry from the spec sheet.
+chain_type = "Triplex chain";                  % [SPEC SHEET]
+final_drive_ratio_specsheet = 6;                % [SPEC SHEET] documented for LAST
+                                                 % YEAR's EMRAX 228 + chain setup --
+                                                 % NOT confirmed for this year's build.
+                                                 % Verify by counting sprocket teeth;
+                                                 % gear_ratio_i above still defaults
+                                                 % to 3.5 pending that check.
+diff_make       = "Drexler FSAE Differential";  % [SPEC SHEET]
+diff_eta        = NaN;                          % [-] differential efficiency — TBD
+diff_bias_ratio = NaN;                          % [-] torque bias/locking behaviour —
+                                                 %     TBD, get Drexler datasheet or bench test
+halfshaft_length    = 0.450;    % [m] 450 mm                              [SPEC SHEET]
+halfshaft_material  = "Hardened steel";                                 % [SPEC SHEET]
+halfshaft_joint     = "Tripod";                                         % [SPEC SHEET]
+halfshaft_k_torsion = NaN;      % [Nm/rad] torsional stiffness — TBD
+halfshaft_backlash  = NaN;      % [rad] — TBD
+
 %% =========================================================================
 % 5. VEHICLE BODY (placeholders for longitudinal TC)
 % =========================================================================
 
-m_v   = NaN;            % [kg] vehicle mass (ready-to-run)
-L     = NaN;            % [m] wheelbase
-a     = NaN;            % [m] CG to front axle
-b     = NaN;            % [m] CG to rear axle  (a + b = L)
-h_cg  = NaN;            % [m] CG height
-g     = 9.81;           % [m/s^2]
-CdA   = NaN;            % [m^2] drag area
-Crr   = NaN;            % [-] rolling resistance coefficient
-rho_air = 1.225;        % [kg/m^3] air density (sea level approx.)
-v_x   = NaN;            % [m/s] vehicle longitudinal speed — runtime / estimate
+m_v_no_driver = 242;    % [kg] mass without driver: 96.8 front + 145.2 rear [SPEC SHEET]
+m_driver      = 68;     % [kg] FSAE standard driver mass                   [SPEC SHEET / RULEBOOK]
+m_v           = m_v_no_driver + m_driver;  % [kg] ready-to-run mass        [CALCULATED]
+L     = 1.550;          % [m] wheelbase                                    [SPEC SHEET]
+track_f = 1.200;        % [m] front track                                  [SPEC SHEET]
+track_r = 1.150;        % [m] rear track                                   [SPEC SHEET]
+% a, b derived from the WITH-DRIVER 50/50 front/rear weight distribution
+% stated in the spec sheet. Assumes left/right symmetry; not independently
+% verified against a corner-weight measurement.
+a     = L/2;             % [m] CG to front axle                            [CALCULATED, 50/50 split]
+b     = L/2;             % [m] CG to rear axle                             [CALCULATED, 50/50 split]
+h_cg  = 0.289;            % [m] CG height — this is the DESIGN target value;
+                          %     the spec sheet's "Confirmed via" field is
+                          %     blank, so it has not been physically verified [SPEC SHEET]
+g     = 9.81;             % [m/s^2]
+CdA   = NaN;               % [m^2] drag area — not documented; the spec
+                            %       sheet's aero section is blank, car may
+                            %       not run active/fixed aero devices
+Crr   = NaN;               % [-] rolling resistance coefficient — not documented
+rho_air = 1.225;            % [kg/m^3] air density (sea level approx.)
+v_x   = NaN;                % [m/s] vehicle longitudinal speed — runtime / estimate
 
 %% =========================================================================
 % 6. WHEELS & TYRES — four corners (placeholders)
 % Corner order throughout: FL, FR, RL, RR
 % =========================================================================
 
+tyre_model = "Goodyear D2704 20.0x7.0-13";  % same tyre front & rear       [SPEC SHEET]
+R_nom = (20.4/2) * 0.0254;    % [m] nominal (unloaded) radius from the
+                               %     20.4 in wheel+tyre diameter            [SPEC SHEET, converted]
+% R_e below is the LOADED/effective rolling radius used in the slip-ratio
+% calc -- it is not the same as R_nom above and still needs measuring.
 R_e = NaN;              % [m] effective rolling radius (all four if same tyres)
 R_e_FL = NaN; R_e_FR = NaN; R_e_RL = NaN; R_e_RR = NaN; % [m] per corner if needed
 J_w  = NaN;             % [kg·m^2] one wheel+hub+rotor inertia about axle
@@ -171,7 +259,9 @@ kappa_target = NaN;     % [-] target slip for driven axle(s)
 K_p_tc = NaN;           % [-] TC proportional gain — tune
 K_i_tc = NaN;           % [-] TC integral gain — tune
 T_s    = NaN;           % [s] controller sample time — match ECU / model fixed step
-driven_axle = "RWD";    % "RWD" | "FWD" | "AWD" — TBC for our car
+driven_axle = "RWD";    % "RWD" | "FWD" | "AWD" -- confirmed by spec sheet:
+                         % both rear wheels driven, 1 motor rear-mounted
+                         % through the differential [SPEC SHEET]
 
 %% =========================================================================
 % 8. Useful derived helpers (fill once config + pack known)
@@ -184,5 +274,5 @@ T_from_I_cont = K_T * I_cont;   % [Nm]
 % Shaft power ↔ angular speed: P = T * omega
 % DC-side power for FSAE limiter (needs efficiency): P_DC = (T * omega) / eta
 
-fprintf('parameters.m loaded: winding=%s, cooling=%s, i=%.2f, K_T=%.2f, T_cont=%g Nm\n', ...
-    winding_type, cooling_type, i_g, K_T, T_cont);
+fprintf('parameters.m loaded: winding=%s, cooling=%s, i=%.2f, K_T=%.2f, T_cont=%g Nm, m_v=%g kg\n', ...
+    winding_type, cooling_type, i_g, K_T, T_cont, m_v);
