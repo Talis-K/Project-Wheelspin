@@ -1,546 +1,1117 @@
-%% SINGLE-WHEEL TRACTION-CONTROL SIMULATION
-% Simulation-only model based on VehicleSpecSheet2025.pdf.
+%% TCS Mid-Fidelity Real-Time Simulation
+% Single-wheel traction-control model
 %
-% The model represents one rear driven wheel. The other rear wheel is
-% assumed to behave identically and receive 50% of the differential torque.
+% UI controls:
+%   - Accelerator slider: 0-100 %
+%   - TCS ON/OFF switch
+%   - Vehicle speed gauge
+%   - Live plots:
+%       Vehicle speed
+%       Wheel slip
+%       Motor torque
+%       Tyre force
 %
-% Model equations:
-%   Slip ratio:       kappa = (r*omega - Vx)/max(|Vx|,Vepsilon)
-%   Wheel dynamics:   J*d(omega)/dt = Twheel - Fx*r
-%   Vehicle dynamics: m*d(Vx)/dt = sum(Fx) - resistance
-%   Wheel torque:     Twheel = Tmotor*gearRatio*efficiency*torqueSplit
-%
-% Parameters not included in the vehicle specification sheet are clearly
-% marked as modelling assumptions.
+% The simulation runs continuously while the UI is open.
+% Switching TCS OFF pauses the simulation.
 
 clear;
 clc;
 close all;
 
-%% Vehicle specification data
-
-P.g = 9.81;
-
-% Mass data
-P.massWithoutDriver       = 242;       % kg
-P.driverMass              = 68;        % kg
-P.vehicleMass             = P.massWithoutDriver + P.driverMass;
-P.frontWeightFraction     = 0.50;
-P.rearWeightFraction      = 1 - P.frontWeightFraction;
-P.drivenWheelCount        = 2;
-
-% Each rear-wheel model must accelerate half of the complete vehicle.
-P.equivalentMass          = P.vehicleMass/P.drivenWheelCount;
-
-% Static vertical load on one rear wheel
-P.staticNormalLoad = ...
-    P.vehicleMass*P.g*P.rearWeightFraction/P.drivenWheelCount;
-
-% Vehicle geometry
-P.wheelbase               = 1550e-3;   % m
-P.cgHeight                = 289e-3;    % m
-P.frontTrack              = 1200e-3;   % m
-P.rearTrack               = 1150e-3;   % m
-
-% Tyre data: Goodyear D2704 20.0x7.0-13
-% The spec sheet lists a measured diameter of 20.4 inches.
-P.tyreDiameter            = 20.4*0.0254;
-P.tyreRadius              = P.tyreDiameter/2;
-
-% Motor data: EMRAX 228 High Voltage
-P.motorPeakTorque         = 220;       % Nm
-P.motorContinuousTorque   = 112;       % Nm
-P.motorPeakPower          = 104e3;     % W
-P.motorContinuousPower    = 64e3;      % W
-P.motorPowerRPM           = 4500;      % rpm
-P.motorMaximumRPM         = 5170;      % rpm
-P.motorBaseSpeedSheet     = 6500;      % rpm, sheet value
-
-% Electrical power limits
-P.inverterPeakPower       = 85e3;      % W
-P.accumulatorPeakPower    = 80e3;      % W
-P.systemPeakPower = min([P.motorPeakPower, ...
-                         P.inverterPeakPower, ...
-                         P.accumulatorPeakPower]);
-
-% Drivetrain
-P.gearRatio               = 6.0;
-P.differentialTorqueSplit = 1/P.drivenWheelCount;
-
-%% Modelling assumptions
-
-P.drivetrainEfficiency    = 0.95;
-P.wheelInertia            = 0.90;      % kg*m^2
-P.motorTimeConstant       = 0.020;     % s
-P.rollingResistance       = 0.015;
-P.rollSpeedSmoothing      = 0.20;      % m/s
-
-% No aerodynamic drag is included because the specification sheet lists
-% the aerodynamic configuration as N/A.
-
-% Pacejka-style longitudinal tyre-model assumptions
-P.muDry                   = 1.20;
-P.muLow                   = 0.70;
-P.magicB                  = 10.0;
-P.magicC                  = 1.90;
-P.magicE                  = 0.97;
-
-%% Traction-control assumptions
-
-P.targetSlip              = 0.12;
-P.activationSlip          = 0.13;
-P.lowSpeedThreshold       = 1.50;      % m/s
-P.slipDenominatorMinimum  = 0.50;      % m/s
-P.slipFilterTimeConstant  = 0.020;     % s
-
-% PI torque controller
-P.Kp                      = 1000;      % Nm/slip
-P.Ki                      = 1200;      % Nm/(slip*s)
-P.Kaw                     = 1/P.Kp;
-P.integratorMinimum       = -0.20;
-P.integratorMaximum       = 0.20;
-
-% Torque slew limits
-P.torqueCutRate           = 8000;      % Nm/s
-P.torqueReturnRate        = 300;       % Nm/s
-
-%% Simulation configuration
-
-P.dt                      = 0.0005;    % plant time step
-P.controllerSampleTime    = 0.002;     % controller sample time
-P.stopTime                = 4.0;
-P.controllerStride = round(P.controllerSampleTime/P.dt);
-
-assert(abs(P.controllerStride*P.dt - ...
-    P.controllerSampleTime) < 1e-12, ...
-    'Controller sample time must be an integer multiple of dt.');
-
-%% Calculate nominal controller feed-forward torque
-
-[FxTarget, ~, accelerationTarget] = ...
-    longitudinalForces(P.targetSlip, 10, P.muDry, P);
-
-targetWheelAcceleration = ...
-    (1 + P.targetSlip)*accelerationTarget/P.tyreRadius;
-
-targetWheelTorque = ...
-    FxTarget*P.tyreRadius + ...
-    P.wheelInertia*targetWheelAcceleration;
-
-P.feedForwardTorque = targetWheelTorque/( ...
-    P.gearRatio*P.drivetrainEfficiency* ...
-    P.differentialTorqueSplit);
-
-% Conservative torque cap while slip ratio is unreliable near standstill
-P.launchTorqueCap = min(0.90*P.feedForwardTorque, ...
-                        P.motorPeakTorque);
-
-%% Driver and road inputs
-
-time = (0:P.dt:P.stopTime).';
-
-% Full-throttle launch with a pedal ramp
-pedal = (time - 0.10)/(0.80 - 0.10);
-pedal = min(max(pedal,0),1);
-
-% Temporary low-friction surface
-roadMu = P.muDry*ones(size(time));
-roadMu(time >= 2.20 & time < 3.00) = P.muLow;
-
-
-%% UI figure
+%% ========================================================================
+%  UI
+% =========================================================================
 
 app = TCS_UI;
 
 
-%% Wait for simulation switch
+%% ========================================================================
+%  VEHICLE SPECIFICATION
+% =========================================================================
 
-while strcmp(app.Switch.Value, 'Off')
-    drawnow;
-    pause(0.05);
-end
+P.mass = 1600;                 % Vehicle mass [kg]
 
-%% Run simulations
+P.wheelRadius = 0.31;         % Effective tyre radius [m]
 
-TCS_OFF = simulateVehicle(time, pedal, roadMu, P, false);
-TCS_ON  = simulateVehicle(time, pedal, roadMu, P, true);
+P.finalDriveRatio = 3.5;      % Final drive ratio
 
-%% Performance calculations
+P.drivetrainEfficiency = 0.95;
 
-validOff = TCS_OFF.vehicleSpeed > 0.5;
-validOn  = TCS_ON.vehicleSpeed  > 0.5;
+P.gravity = 9.81;              % [m/s^2]
 
-peakSlipOff = max(TCS_OFF.slip(validOff));
-peakSlipOn  = max(TCS_ON.slip(validOn));
+P.airDensity = 1.225;          % [kg/m^3]
 
-slipPowerOff = abs(TCS_OFF.tyreForce .* ...
-    (P.tyreRadius*TCS_OFF.wheelSpeed - TCS_OFF.vehicleSpeed));
+P.frontalArea = 2.2;           % [m^2]
 
-slipPowerOn = abs(TCS_ON.tyreForce .* ...
-    (P.tyreRadius*TCS_ON.wheelSpeed - TCS_ON.vehicleSpeed));
+P.dragCoefficient = 0.30;
 
-slipEnergyOff = trapz(time,slipPowerOff);
-slipEnergyOn  = trapz(time,slipPowerOn);
+P.rollingResistance = 0.015;
 
-activeIndex = find(TCS_ON.controllerActive,1,'first');
 
-if isempty(activeIndex)
-    activationTime = NaN;
-else
-    activationTime = time(activeIndex);
-end
+%% ========================================================================
+%  LOAD DISTRIBUTION
+% =========================================================================
 
-speedAtMaximumPower = ...
-    (P.motorPowerRPM*2*pi/60)/P.gearRatio * ...
-    P.tyreRadius*3.6;
+% Rear-wheel drive.
+% One driven rear wheel represents half of the rear axle.
 
-maximumGearedSpeed = ...
-    (P.motorMaximumRPM*2*pi/60)/P.gearRatio * ...
-    P.tyreRadius*3.6;
+P.rearWeightDistribution = 0.55;
 
-fprintf('\nSINGLE-WHEEL TRACTION-CONTROL RESULTS\n');
-fprintf('Vehicle mass with driver:       %.1f kg\n',P.vehicleMass);
-fprintf('Equivalent mass per model:      %.1f kg\n',P.equivalentMass);
-fprintf('Static rear-wheel normal load:  %.1f N\n',P.staticNormalLoad);
-fprintf('Effective tyre radius:          %.4f m\n',P.tyreRadius);
-fprintf('Nominal TCS feed-forward torque: %.1f Nm\n',P.feedForwardTorque);
-fprintf('Low-speed launch torque cap:    %.1f Nm\n',P.launchTorqueCap);
-fprintf('Vehicle speed at 4500 rpm:      %.1f km/h\n',speedAtMaximumPower);
-fprintf('Maximum geared vehicle speed:   %.1f km/h\n\n',maximumGearedSpeed);
+P.rearAxleLoad = ...
+    P.mass * P.gravity * P.rearWeightDistribution;
 
-fprintf('Peak slip, TCS OFF:             %.3f\n',peakSlipOff);
-fprintf('Peak slip, TCS ON:              %.3f\n',peakSlipOn);
-fprintf('Final speed, TCS OFF:           %.2f km/h\n', ...
-    TCS_OFF.vehicleSpeed(end)*3.6);
-fprintf('Final speed, TCS ON:            %.2f km/h\n', ...
-    TCS_ON.vehicleSpeed(end)*3.6);
-fprintf('Slip energy, TCS OFF:           %.1f J\n',slipEnergyOff);
-fprintf('Slip energy, TCS ON:            %.1f J\n',slipEnergyOn);
-fprintf('TCS activation time:            %.3f s\n',activationTime);
+P.drivenWheelLoad = P.rearAxleLoad / 2;
 
-%% Results plots
 
-figure('Color','w','Position',[100 100 1200 720]);
+%% ========================================================================
+%  WHEEL / DRIVETRAIN
+% =========================================================================
 
-subplot(2,2,1);
-plot(time,TCS_OFF.vehicleSpeed*3.6,'--','LineWidth',1.5);
-hold on;
-plot(time,TCS_ON.vehicleSpeed*3.6,'LineWidth',1.8);
-grid on;
-xlabel('Time (s)');
-ylabel('Vehicle speed (km/h)');
-title('Vehicle speed');
-legend('TCS OFF','TCS ON','Location','northwest');
+P.wheelInertia = 0.90;         % Wheel inertia [kg m^2]
 
-subplot(2,2,2);
-plot(time,TCS_OFF.slip,'--','LineWidth',1.3);
-hold on;
-plot(time,TCS_ON.slip,'LineWidth',1.8);
-plot(time,P.targetSlip*ones(size(time)),':','LineWidth',1.3);
-grid on;
-xlabel('Time (s)');
-ylabel('Longitudinal slip ratio');
-title('Wheel slip — display limited to \kappa = 1');
-legend('TCS OFF','TCS ON','Target','Location','northeast');
-ylim([-0.05 1]);
+P.motorTimeConstant = 0.020;   % Motor response time [s]
 
-subplot(2,2,3);
-plot(time,TCS_ON.requestedTorque,':','LineWidth',1.3);
-hold on;
-plot(time,TCS_OFF.motorTorque,'--','LineWidth',1.3);
-plot(time,TCS_ON.motorTorque,'LineWidth',1.8);
-grid on;
-xlabel('Time (s)');
-ylabel('Motor torque (Nm)');
-title('Motor torque intervention');
-legend('Driver request','TCS OFF','TCS ON','Location','best');
 
-subplot(2,2,4);
-plot(time,TCS_OFF.tyreForce/1000,'--','LineWidth',1.3);
-hold on;
-plot(time,TCS_ON.tyreForce/1000,'LineWidth',1.8);
-grid on;
-xlabel('Time (s)');
-ylabel('Longitudinal tyre force (kN)');
-title('Force generated by one rear tyre');
-legend('TCS OFF','TCS ON','Location','best');
+%% ========================================================================
+%  MOTOR DATA
+% =========================================================================
 
-if exist('sgtitle','file') == 2
-    sgtitle('E59 Single-Wheel Traction-Control Simulation');
-end
+P.motorPeakTorque = 220;       % Peak torque [Nm]
 
-%% Local functions
+P.motorContinuousTorque = 112; % Continuous torque [Nm]
 
-function R = simulateVehicle(time,pedal,roadMu,P,tcsEnabled)
+P.motorPeakPower = 104e3;      % Peak power [W]
 
-    numberOfSteps = length(time);
+P.motorContinuousPower = 64e3; % Continuous power [W]
 
-    vehicleSpeed       = zeros(numberOfSteps,1);
-    wheelSpeed         = zeros(numberOfSteps,1);
-    motorTorque        = zeros(numberOfSteps,1);
-    torqueCommand      = zeros(numberOfSteps,1);
-    desiredTorque      = zeros(numberOfSteps,1);
-    requestedTorque    = zeros(numberOfSteps,1);
-    motorTorqueLimit   = zeros(numberOfSteps,1);
-    slip               = zeros(numberOfSteps,1);
-    filteredSlip       = zeros(numberOfSteps,1);
-    tyreForce          = zeros(numberOfSteps,1);
-    normalLoad         = zeros(numberOfSteps,1);
-    acceleration       = zeros(numberOfSteps,1);
-    controllerActive   = false(numberOfSteps,1);
+P.motorPowerRPM = 4500;
 
-    filteredSlipMemory = 0;
-    integratorMemory   = 0;
-    commandMemory      = 0;
-    desiredMemory      = 0;
-    activeMemory       = false;
+P.motorMaximumRPM = 5170;
 
-    filterAlpha = P.controllerSampleTime/ ...
-                  P.slipFilterTimeConstant;
+P.motorBaseSpeedRPM = 6500;
 
-    for k = 1:numberOfSteps
 
-        omegaMotor = P.gearRatio*wheelSpeed(k);
+%% ========================================================================
+%  TYRE / ROAD PARAMETERS
+% =========================================================================
 
-        motorTorqueLimit(k) = ...
-            calculateMotorTorqueLimit(omegaMotor,P);
+P.muDry = 1.0;
 
-        requestedTorque(k) = min( ...
-            pedal(k)*P.motorPeakTorque, ...
-            motorTorqueLimit(k));
+P.muLow = 0.35;
 
-        slip(k) = calculateSlip( ...
-            wheelSpeed(k),vehicleSpeed(k),P);
+P.targetSlip = 0.12;
 
-        controllerHit = ...
-            mod(k-1,P.controllerStride) == 0;
+P.activationSlip = 0.13;
 
-        if controllerHit
+P.lowSpeedThreshold = 1.5;
 
-            limitedSlip = min(max(slip(k),-3),3);
+P.minimumSlipSpeed = 0.5;
 
-            filteredSlipMemory = filteredSlipMemory + ...
-                filterAlpha*(limitedSlip-filteredSlipMemory);
 
-            if ~tcsEnabled
+%% ========================================================================
+%  CONTROLLER PARAMETERS
+% =========================================================================
 
-                desiredMemory    = requestedTorque(k);
-                integratorMemory = 0;
-                activeMemory     = false;
+P.slipFilterTime = 0.020;
 
-            elseif pedal(k) < 0.02
+P.Kp = 500;
 
-                desiredMemory    = 0;
-                integratorMemory = 0;
-                activeMemory     = false;
+P.Ki = 1500;
 
-            elseif vehicleSpeed(k) < P.lowSpeedThreshold
+P.torqueRateIncrease = 5000;   % Nm/s
 
-                % Slip ratio is unreliable near zero vehicle speed.
-                desiredMemory = min(requestedTorque(k), ...
-                                    P.launchTorqueCap);
+P.torqueRateDecrease = 15000;  % Nm/s
 
-                integratorMemory = 0;
-                activeMemory     = false;
 
-            else
+%% ========================================================================
+%  SIMULATION CONFIGURATION
+% =========================================================================
 
-                if ~activeMemory && ...
-                        filteredSlipMemory > P.activationSlip
+% Physics timestep
+P.dt = 0.0005;                 % 0.5 ms
 
-                    activeMemory     = true;
-                    integratorMemory = 0;
-                end
+% Controller update rate
+P.controllerSampleTime = 0.002;    % 2 ms
 
-                if activeMemory
+% Display update rate
+P.displaySampleTime = 0.033;       % approximately 30 Hz
 
-                    slipError = ...
-                        P.targetSlip-filteredSlipMemory;
+% Number of physics steps between controller updates
+P.controllerStride = ...
+    round(P.controllerSampleTime / P.dt);
 
-                    unsaturatedTorque = ...
-                        P.feedForwardTorque + ...
-                        P.Kp*slipError + ...
-                        P.Ki*integratorMemory;
+% Number of physics steps between display updates
+P.displayStride = ...
+    round(P.displaySampleTime / P.dt);
 
-                    saturatedTorque = min(max( ...
-                        unsaturatedTorque,0), ...
-                        requestedTorque(k));
+% Rolling graph history
+P.historyTime = 15.0;
 
-                    integratorDerivative = slipError + ...
-                        P.Kaw*(saturatedTorque- ...
-                               unsaturatedTorque);
+P.historySteps = ...
+    round(P.historyTime / P.dt);
 
-                    integratorMemory = integratorMemory + ...
-                        P.controllerSampleTime* ...
-                        integratorDerivative;
+assert(P.controllerStride >= 1);
+assert(P.displayStride >= 1);
 
-                    integratorMemory = min(max( ...
-                        integratorMemory, ...
-                        P.integratorMinimum), ...
-                        P.integratorMaximum);
 
-                    desiredMemory = saturatedTorque;
+%% ========================================================================
+%  DRIVER / TORQUE SETTINGS
+% =========================================================================
 
-                else
-                    desiredMemory = requestedTorque(k);
-                end
-            end
-        end
+% Feed-forward torque used by the driver demand.
+%
+% The accelerator slider determines the requested torque.
 
-        filteredSlip(k)     = filteredSlipMemory;
-        desiredTorque(k)    = desiredMemory;
-        controllerActive(k) = activeMemory;
+P.driverTorqueGain = P.motorPeakTorque;
 
-        if tcsEnabled
-            commandMemory = applyRateLimit( ...
-                desiredMemory,commandMemory,P.dt, ...
-                P.torqueCutRate,P.torqueReturnRate);
+% Small launch torque cap to avoid an unrealistic initial torque spike.
+
+P.launchTorqueCap = 160;
+
+
+%% ========================================================================
+%  LIVE PLOT SETUP
+% =========================================================================
+
+plotFigure = figure( ...
+    'Name', 'TCS Real-Time Simulation', ...
+    'NumberTitle', 'off', ...
+    'Color', 'w', ...
+    'Position', [80 80 1100 700]);
+
+tiledlayout(plotFigure, 2, 2);
+
+
+%% Vehicle speed ----------------------------------------------------------
+
+axSpeed = nexttile;
+
+speedLine = plot( ...
+    axSpeed, ...
+    nan, ...
+    nan, ...
+    'LineWidth', 1.5);
+
+grid(axSpeed, 'on');
+
+xlabel(axSpeed, 'Time [s]');
+ylabel(axSpeed, 'Vehicle Speed [km/h]');
+
+title(axSpeed, 'Vehicle Speed');
+
+xlim(axSpeed, [0 P.historyTime]);
+
+ylim(axSpeed, [0 100]);
+
+
+%% Slip -------------------------------------------------------------------
+
+axSlip = nexttile;
+
+slipLine = plot( ...
+    axSlip, ...
+    nan, ...
+    nan, ...
+    'LineWidth', 1.5);
+
+hold(axSlip, 'on');
+
+targetSlipLine = plot( ...
+    axSlip, ...
+    nan, ...
+    nan, ...
+    '--', ...
+    'LineWidth', 1.0);
+
+grid(axSlip, 'on');
+
+xlabel(axSlip, 'Time [s]');
+ylabel(axSlip, 'Slip');
+
+title(axSlip, 'Wheel Slip');
+
+legend( ...
+    axSlip, ...
+    {'Measured Slip', 'Target Slip'}, ...
+    'Location', 'best');
+
+xlim(axSlip, [0 P.historyTime]);
+
+
+%% Motor torque -----------------------------------------------------------
+
+axTorque = nexttile;
+
+torqueLine = plot( ...
+    axTorque, ...
+    nan, ...
+    nan, ...
+    'LineWidth', 1.5);
+
+hold(axTorque, 'on');
+
+requestedTorqueLine = plot( ...
+    axTorque, ...
+    nan, ...
+    nan, ...
+    '--', ...
+    'LineWidth', 1.0);
+
+grid(axTorque, 'on');
+
+xlabel(axTorque, 'Time [s]');
+ylabel(axTorque, 'Torque [Nm]');
+
+title(axTorque, 'Motor Torque');
+
+legend( ...
+    axTorque, ...
+    {'Actual Motor Torque', 'Driver Request'}, ...
+    'Location', 'best');
+
+xlim(axTorque, [0 P.historyTime]);
+
+
+%% Tyre force -------------------------------------------------------------
+
+axForce = nexttile;
+
+forceLine = plot( ...
+    axForce, ...
+    nan, ...
+    nan, ...
+    'LineWidth', 1.5);
+
+grid(axForce, 'on');
+
+xlabel(axForce, 'Time [s]');
+ylabel(axForce, 'Force [N]');
+
+title(axForce, 'Driven Tyre Force');
+
+xlim(axForce, [0 P.historyTime]);
+
+
+%% ========================================================================
+%  INITIAL STATE
+% =========================================================================
+
+state.vehicleSpeed = 0;
+
+state.wheelSpeed = 0;
+
+state.motorTorque = 0;
+
+state.torqueCommand = 0;
+
+state.desiredTorque = 0;
+
+state.filteredSlipMemory = 0;
+
+state.integratorMemory = 0;
+
+state.commandMemory = 0;
+
+state.desiredMemory = 0;
+
+state.activeMemory = false;
+
+state.currentTime = 0;
+
+state.stepCount = 0;
+
+
+%% ========================================================================
+%  FILTER INITIALISATION
+% =========================================================================
+
+state.filterAlpha = ...
+    P.dt / (P.slipFilterTime + P.dt);
+
+
+%% ========================================================================
+%  ROLLING HISTORY
+% =========================================================================
+
+historyTime = nan(P.historySteps, 1);
+
+historySpeed = nan(P.historySteps, 1);
+
+historySlip = nan(P.historySteps, 1);
+
+historyTorque = nan(P.historySteps, 1);
+
+historyRequestedTorque = nan(P.historySteps, 1);
+
+historyTyreForce = nan(P.historySteps, 1);
+
+
+%% ========================================================================
+%  REAL-TIME LOOP
+% =========================================================================
+
+wallClock = tic;
+
+while isvalid(app.UIFigure)
+
+    %% --------------------------------------------------------------------
+    %  Check simulation switch
+    % ---------------------------------------------------------------------
+
+    if strcmp(app.Switch.Value, 'Off')
+
+        drawnow;
+
+        pause(0.02);
+
+        % Reset wall-clock reference so that the simulation does not
+        % attempt to catch up after the user turns it back on.
+
+        wallClock = tic;
+
+        continue;
+
+    end
+
+
+    %% --------------------------------------------------------------------
+    %  Read accelerator
+    % ---------------------------------------------------------------------
+
+    pedal = app.AccelerationsliderSlider.Value / 100;
+
+
+    %% --------------------------------------------------------------------
+    %  Road friction
+    % ---------------------------------------------------------------------
+    %
+    % Keep the existing low-friction road event:
+    %
+    %   0 - 2.2 s       Dry road
+    %   2.2 - 3.0 s     Low friction
+    %   > 3.0 s         Dry road
+    %
+
+    if state.currentTime >= 2.2 && ...
+            state.currentTime < 3.0
+
+        roadMu = P.muLow;
+
+    else
+
+        roadMu = P.muDry;
+
+    end
+
+
+    %% --------------------------------------------------------------------
+    %  One physics step
+    % ---------------------------------------------------------------------
+
+    [state, output] = ...
+        simulateVehicleStep( ...
+        state, ...
+        pedal, ...
+        roadMu, ...
+        P);
+
+
+    %% --------------------------------------------------------------------
+    %  Update simulation time
+    % ---------------------------------------------------------------------
+
+    state.currentTime = ...
+        state.currentTime + P.dt;
+
+    state.stepCount = ...
+        state.stepCount + 1;
+
+
+    %% --------------------------------------------------------------------
+    %  Update rolling history
+    % ---------------------------------------------------------------------
+
+    if state.stepCount <= P.historySteps
+
+        index = state.stepCount;
+
+    else
+
+        % Shift history when buffer is full.
+
+        historyTime(1:end-1) = ...
+            historyTime(2:end);
+
+        historySpeed(1:end-1) = ...
+            historySpeed(2:end);
+
+        historySlip(1:end-1) = ...
+            historySlip(2:end);
+
+        historyTorque(1:end-1) = ...
+            historyTorque(2:end);
+
+        historyRequestedTorque(1:end-1) = ...
+            historyRequestedTorque(2:end);
+
+        historyTyreForce(1:end-1) = ...
+            historyTyreForce(2:end);
+
+        index = P.historySteps;
+
+    end
+
+
+    historyTime(index) = state.currentTime;
+
+    historySpeed(index) = ...
+        state.vehicleSpeed * 3.6;
+
+    historySlip(index) = output.slip;
+
+    historyTorque(index) = ...
+        state.motorTorque;
+
+    historyRequestedTorque(index) = ...
+        output.requestedTorque;
+
+    historyTyreForce(index) = ...
+        output.tyreForce;
+
+
+    %% --------------------------------------------------------------------
+    %  Display update
+    % ---------------------------------------------------------------------
+
+    if mod(state.stepCount, P.displayStride) == 0
+
+        valid = ~isnan(historyTime);
+
+        tPlot = historyTime(valid);
+
+        speedPlot = historySpeed(valid);
+
+        slipPlot = historySlip(valid);
+
+        torquePlot = historyTorque(valid);
+
+        requestedTorquePlot = ...
+            historyRequestedTorque(valid);
+
+        forcePlot = ...
+            historyTyreForce(valid);
+
+
+        %% Vehicle speed
+
+        set( ...
+            speedLine, ...
+            'XData', tPlot, ...
+            'YData', speedPlot);
+
+
+        %% Slip
+
+        set( ...
+            slipLine, ...
+            'XData', tPlot, ...
+            'YData', slipPlot);
+
+        set( ...
+            targetSlipLine, ...
+            'XData', tPlot, ...
+            'YData', ...
+            P.targetSlip * ones(size(tPlot)));
+
+
+        %% Torque
+
+        set( ...
+            torqueLine, ...
+            'XData', tPlot, ...
+            'YData', torquePlot);
+
+        set( ...
+            requestedTorqueLine, ...
+            'XData', tPlot, ...
+            'YData', requestedTorquePlot);
+
+
+        %% Tyre force
+
+        set( ...
+            forceLine, ...
+            'XData', tPlot, ...
+            'YData', forcePlot);
+
+
+        %% Rolling 15-second window
+
+        if state.currentTime <= P.historyTime
+
+            xStart = 0;
+
         else
-            commandMemory = desiredMemory;
+
+            xStart = ...
+                state.currentTime - P.historyTime;
+
         end
 
-        torqueCommand(k) = commandMemory;
+        xEnd = ...
+            max(P.historyTime, state.currentTime);
 
-        [tyreForce(k),normalLoad(k),acceleration(k)] = ...
-            longitudinalForces( ...
-                slip(k),vehicleSpeed(k),roadMu(k),P);
 
-        if k < numberOfSteps
+        xlim(axSpeed, [xStart xEnd]);
 
-            appliedMotorCommand = min( ...
-                torqueCommand(k),motorTorqueLimit(k));
+        xlim(axSlip, [xStart xEnd]);
 
-            motorTorqueDerivative = ...
-                (appliedMotorCommand-motorTorque(k))/ ...
-                P.motorTimeConstant;
+        xlim(axTorque, [xStart xEnd]);
 
-            wheelTorque = motorTorque(k)* ...
-                P.gearRatio* ...
-                P.drivetrainEfficiency* ...
-                P.differentialTorqueSplit;
+        xlim(axForce, [xStart xEnd]);
 
-            wheelAcceleration = ...
-                (wheelTorque- ...
-                 tyreForce(k)*P.tyreRadius)/ ...
-                 P.wheelInertia;
 
-            motorTorque(k+1) = motorTorque(k) + ...
-                P.dt*motorTorqueDerivative;
+        %% Gauge
 
-            wheelSpeed(k+1) = wheelSpeed(k) + ...
-                P.dt*wheelAcceleration;
+        speedKmh = ...
+            state.vehicleSpeed * 3.6;
 
-            vehicleSpeed(k+1) = vehicleSpeed(k) + ...
-                P.dt*acceleration(k);
+        app.Gauge.Value = ...
+            min(max(speedKmh, 0), 100);
 
-            motorTorque(k+1)  = min(max( ...
-                motorTorque(k+1),0),P.motorPeakTorque);
 
-            wheelSpeed(k+1)   = max(wheelSpeed(k+1),0);
-            vehicleSpeed(k+1) = max(vehicleSpeed(k+1),0);
-        end
+        %% Update UI
+
+        drawnow limitrate;
+
     end
 
-    R.vehicleSpeed     = vehicleSpeed;
-    R.wheelSpeed       = wheelSpeed;
-    R.motorTorque      = motorTorque;
-    R.torqueCommand    = torqueCommand;
-    R.desiredTorque    = desiredTorque;
-    R.requestedTorque  = requestedTorque;
-    R.motorTorqueLimit = motorTorqueLimit;
-    R.slip             = slip;
-    R.filteredSlip     = filteredSlip;
-    R.tyreForce        = tyreForce;
-    R.normalLoad       = normalLoad;
-    R.acceleration     = acceleration;
-    R.controllerActive = controllerActive;
+
+    %% --------------------------------------------------------------------
+    %  Real-time pacing
+    % ---------------------------------------------------------------------
+
+    elapsedWallTime = toc(wallClock);
+
+    waitTime = ...
+        state.currentTime - elapsedWallTime;
+
+    if waitTime > 0
+
+        pause(waitTime);
+
+    end
+
 end
 
-function kappa = calculateSlip(wheelSpeed,vehicleSpeed,P)
 
-    denominator = max(abs(vehicleSpeed), ...
-                      P.slipDenominatorMinimum);
+%% ========================================================================
+%  SINGLE PHYSICS STEP
+% =========================================================================
 
-    kappa = (P.tyreRadius*wheelSpeed-vehicleSpeed)/ ...
-            denominator;
-end
+function [state, output] = ...
+    simulateVehicleStep(state, pedal, roadMu, P)
 
-function torqueLimit = calculateMotorTorqueLimit(omegaMotor,P)
+% -------------------------------------------------------------------------
+% Motor speed
+% -------------------------------------------------------------------------
 
-    motorRPM = abs(omegaMotor)*60/(2*pi);
+motorRPM = ...
+    state.wheelSpeed * ...
+    P.finalDriveRatio * ...
+    60 / (2*pi);
 
-    if motorRPM >= P.motorMaximumRPM
-        torqueLimit = 0;
+
+% -------------------------------------------------------------------------
+% Motor torque limit
+% -------------------------------------------------------------------------
+
+motorTorqueLimit = ...
+    calculateMotorTorqueLimit( ...
+    motorRPM, ...
+    P);
+
+
+% -------------------------------------------------------------------------
+% Driver requested torque
+% -------------------------------------------------------------------------
+
+requestedTorque = ...
+    pedal * P.driverTorqueGain;
+
+requestedTorque = ...
+    min(requestedTorque, motorTorqueLimit);
+
+
+% -------------------------------------------------------------------------
+% Calculate slip
+% -------------------------------------------------------------------------
+
+slip = ...
+    calculateSlip( ...
+    state.wheelSpeed, ...
+    state.vehicleSpeed, ...
+    P);
+
+
+% -------------------------------------------------------------------------
+% Controller update
+% -------------------------------------------------------------------------
+
+controllerUpdate = ...
+    mod(state.stepCount, P.controllerStride) == 0;
+
+
+if controllerUpdate
+
+    % Low-pass filter the slip signal.
+
+    state.filteredSlipMemory = ...
+        state.filteredSlipMemory + ...
+        state.filterAlpha * ...
+        (slip - state.filteredSlipMemory);
+
+
+    filteredSlip = ...
+        state.filteredSlipMemory;
+
+
+    % Default desired torque is the driver's request.
+
+    desiredTorque = requestedTorque;
+
+
+    % ---------------------------------------------------------------------
+    % Very low accelerator input
+    % ---------------------------------------------------------------------
+
+    if pedal < 0.02
+
+        desiredTorque = 0;
+
+        state.integratorMemory = 0;
+
+        state.activeMemory = false;
+
+
+    % ---------------------------------------------------------------------
+    % Low-speed launch limitation
+    % ---------------------------------------------------------------------
+
+    elseif state.vehicleSpeed < P.lowSpeedThreshold
+
+        desiredTorque = ...
+            min(requestedTorque, P.launchTorqueCap);
+
+        state.integratorMemory = 0;
+
+        state.activeMemory = false;
+
+
+    % ---------------------------------------------------------------------
+    % TCS control
+    % ---------------------------------------------------------------------
+
+    elseif filteredSlip > P.activationSlip
+
+        state.activeMemory = true;
+
+        slipError = ...
+            filteredSlip - P.targetSlip;
+
+        state.integratorMemory = ...
+            state.integratorMemory + ...
+            slipError * ...
+            P.controllerSampleTime;
+
+        % Anti-windup
+
+        state.integratorMemory = ...
+            max( ...
+            min(state.integratorMemory, 0.25), ...
+            -0.25);
+
+
+        % PI torque correction
+
+        torqueCorrection = ...
+            P.Kp * slipError + ...
+            P.Ki * state.integratorMemory;
+
+
+        desiredTorque = ...
+            requestedTorque - torqueCorrection;
+
+
     else
-        powerLimitedTorque = ...
-            P.systemPeakPower/max(abs(omegaMotor),1);
 
-        torqueLimit = min(P.motorPeakTorque, ...
-                          powerLimitedTorque);
+        % Below activation threshold.
+
+        state.activeMemory = false;
+
+        % Gradually release the integrator.
+
+        state.integratorMemory = ...
+            0.95 * state.integratorMemory;
+
+        desiredTorque = requestedTorque;
+
     end
+
+
+    % Limit desired torque.
+
+    desiredTorque = ...
+        max(0, min(desiredTorque, motorTorqueLimit));
+
+
+    state.desiredTorque = desiredTorque;
+
 end
 
-function [Fx,Fz,ax] = longitudinalForces( ...
-    kappa,vehicleSpeed,roadMu,P)
 
-    % Pacejka-style pure-longitudinal tyre shape
-    limitedSlip = min(max(kappa,-20),20);
+% -------------------------------------------------------------------------
+% Use previous controller command between controller updates
+% -------------------------------------------------------------------------
 
-    magicArgument = ...
-        P.magicB*limitedSlip - ...
-        P.magicE*(P.magicB*limitedSlip - ...
-                  atan(P.magicB*limitedSlip));
+desiredTorque = state.desiredTorque;
 
-    tyreShape = sin(P.magicC*atan(magicArgument));
 
-    % q is the signed longitudinal force coefficient
-    q = roadMu*tyreShape;
+% -------------------------------------------------------------------------
+% Torque slew-rate limitation
+% -------------------------------------------------------------------------
 
-    % Rolling resistance allocated to one equivalent wheel channel
-    rollingForcePerWheel = ...
-        P.rollingResistance*P.vehicleMass*P.g/ ...
-        P.drivenWheelCount * ...
-        tanh(vehicleSpeed/P.rollSpeedSmoothing);
+state.torqueCommand = ...
+    applyRateLimit( ...
+    state.torqueCommand, ...
+    desiredTorque, ...
+    P);
 
-    % Quasi-static longitudinal load-transfer solution:
-    %
-    % Fz,rear = m*g*rearFraction + m*ax*h/L
-    % Fx      = q*Fz
-    %
-    % The expression below solves the coupled force/load-transfer equations.
-    denominator = 1-q*P.cgHeight/P.wheelbase;
-    denominator = max(denominator,0.25);
 
-    ax = (q*P.g*P.rearWeightFraction - ...
-          P.rollingResistance*P.g* ...
-          tanh(vehicleSpeed/P.rollSpeedSmoothing))/ ...
-          denominator;
+% -------------------------------------------------------------------------
+% Tyre / longitudinal forces
+% -------------------------------------------------------------------------
 
-    Fz = (P.vehicleMass*P.g*P.rearWeightFraction + ...
-          P.vehicleMass*ax*P.cgHeight/P.wheelbase)/ ...
-          P.drivenWheelCount;
+[tyreForce, aerodynamicDrag, rollingForce] = ...
+    longitudinalForces( ...
+    state.vehicleSpeed, ...
+    state.wheelSpeed, ...
+    state.torqueCommand, ...
+    roadMu, ...
+    P);
 
-    Fz = max(Fz,0);
-    Fx = q*Fz;
 
-    % Numerical consistency check for the equivalent single-wheel channel
-    axCheck = (Fx-rollingForcePerWheel)/P.equivalentMass;
+% -------------------------------------------------------------------------
+% Motor dynamics
+% -------------------------------------------------------------------------
 
-    if isfinite(axCheck)
-        ax = axCheck;
-    end
+motorTorqueDerivative = ...
+    (state.torqueCommand - state.motorTorque) / ...
+    P.motorTimeConstant;
+
+state.motorTorque = ...
+    state.motorTorque + ...
+    motorTorqueDerivative * P.dt;
+
+
+% -------------------------------------------------------------------------
+% Motor torque cannot be negative
+% -------------------------------------------------------------------------
+
+state.motorTorque = ...
+    max(0, state.motorTorque);
+
+
+% -------------------------------------------------------------------------
+% Wheel dynamics
+% -------------------------------------------------------------------------
+
+wheelTorque = ...
+    state.motorTorque * ...
+    P.finalDriveRatio * ...
+    P.drivetrainEfficiency;
+
+
+wheelAngularAcceleration = ...
+    (wheelTorque - tyreForce * P.wheelRadius) / ...
+    P.wheelInertia;
+
+
+% -------------------------------------------------------------------------
+% Vehicle dynamics
+% -------------------------------------------------------------------------
+
+totalResistingForce = ...
+    aerodynamicDrag + rollingForce;
+
+
+vehicleAcceleration = ...
+    (tyreForce - totalResistingForce) / ...
+    P.mass;
+
+
+% -------------------------------------------------------------------------
+% Integrate wheel speed
+% -------------------------------------------------------------------------
+
+state.wheelSpeed = ...
+    state.wheelSpeed + ...
+    wheelAngularAcceleration * P.dt;
+
+
+% -------------------------------------------------------------------------
+% Integrate vehicle speed
+% -------------------------------------------------------------------------
+
+state.vehicleSpeed = ...
+    state.vehicleSpeed + ...
+    vehicleAcceleration * P.dt;
+
+
+% -------------------------------------------------------------------------
+% Prevent negative speeds
+% -------------------------------------------------------------------------
+
+state.wheelSpeed = ...
+    max(0, state.wheelSpeed);
+
+state.vehicleSpeed = ...
+    max(0, state.vehicleSpeed);
+
+
+% -------------------------------------------------------------------------
+% Recalculate output slip
+% -------------------------------------------------------------------------
+
+output.slip = ...
+    calculateSlip( ...
+    state.wheelSpeed, ...
+    state.vehicleSpeed, ...
+    P);
+
+
+output.filteredSlip = ...
+    state.filteredSlipMemory;
+
+
+output.tyreForce = tyreForce;
+
+output.normalLoad = ...
+    P.drivenWheelLoad;
+
+output.acceleration = ...
+    vehicleAcceleration;
+
+output.requestedTorque = ...
+    requestedTorque;
+
+output.motorTorqueLimit = ...
+    motorTorqueLimit;
+
+output.controllerActive = ...
+    state.activeMemory;
+
 end
 
-function output = applyRateLimit( ...
-    desired,previous,dt,cutRate,returnRate)
 
-    torqueChange = desired-previous;
+%% ========================================================================
+%  SLIP CALCULATION
+% =========================================================================
 
-    if torqueChange < 0
-        torqueChange = max(torqueChange,-cutRate*dt);
-    else
-        torqueChange = min(torqueChange,returnRate*dt);
-    end
+function slip = ...
+    calculateSlip(wheelSpeed, vehicleSpeed, P)
 
-    output = max(previous+torqueChange,0);
+wheelRoadSpeed = ...
+    wheelSpeed * P.wheelRadius;
+
+
+denominator = ...
+    max(abs(vehicleSpeed), P.minimumSlipSpeed);
+
+
+slip = ...
+    (wheelRoadSpeed - vehicleSpeed) / denominator;
+
+
+% Avoid extreme numerical values at standstill.
+
+slip = ...
+    max(-1, min(slip, 2));
+
+end
+
+
+%% ========================================================================
+%  MOTOR TORQUE LIMIT
+% =========================================================================
+
+function torqueLimit = ...
+    calculateMotorTorqueLimit(motorRPM, P)
+
+motorRPM = ...
+    max(0, motorRPM);
+
+
+% Peak torque region
+
+if motorRPM <= P.motorPowerRPM
+
+    torqueLimit = ...
+        P.motorPeakTorque;
+
+else
+
+    motorSpeedRad = ...
+        motorRPM * 2*pi/60;
+
+    torqueLimit = ...
+        P.motorPeakPower / ...
+        max(motorSpeedRad, 1);
+
+end
+
+
+% Motor maximum speed limit
+
+if motorRPM >= P.motorMaximumRPM
+
+    torqueLimit = 0;
+
+end
+
+
+torqueLimit = ...
+    max(0, min(torqueLimit, P.motorPeakTorque));
+
+end
+
+
+%% ========================================================================
+%  LONGITUDINAL FORCES
+% =========================================================================
+
+function [tyreForce, aerodynamicDrag, rollingForce] = ...
+    longitudinalForces( ...
+    vehicleSpeed, ...
+    wheelSpeed, ...
+    wheelTorque, ...
+    roadMu, ...
+    P)
+
+% -------------------------------------------------------------------------
+% Calculate slip
+% -------------------------------------------------------------------------
+
+slip = ...
+    calculateSlip( ...
+    wheelSpeed, ...
+    vehicleSpeed, ...
+    P);
+
+
+% -------------------------------------------------------------------------
+% Simple tyre friction model
+% -------------------------------------------------------------------------
+
+% The tyre force increases approximately linearly with slip until the
+% available friction limit is reached.
+
+tyreForceIdeal = ...
+    P.drivenWheelLoad * ...
+    roadMu * ...
+    tanh(8 * max(slip, 0));
+
+
+% -------------------------------------------------------------------------
+% Available friction force
+% -------------------------------------------------------------------------
+
+maximumTyreForce = ...
+    roadMu * P.drivenWheelLoad;
+
+
+tyreForce = ...
+    min(tyreForceIdeal, maximumTyreForce);
+
+
+% Prevent negative driving force.
+
+tyreForce = ...
+    max(0, tyreForce);
+
+
+% -------------------------------------------------------------------------
+% Aerodynamic drag
+% -------------------------------------------------------------------------
+
+aerodynamicDrag = ...
+    0.5 * ...
+    P.airDensity * ...
+    P.frontalArea * ...
+    P.dragCoefficient * ...
+    vehicleSpeed^2;
+
+
+% -------------------------------------------------------------------------
+% Rolling resistance
+% -------------------------------------------------------------------------
+
+rollingForce = ...
+    P.rollingResistance * ...
+    P.mass * ...
+    P.gravity;
+
+
+% At zero speed, avoid applying rolling resistance against a stationary
+% vehicle.
+
+if vehicleSpeed <= 0 && tyreForce <= rollingForce
+
+    rollingForce = 0;
+
+end
+
+end
+
+
+%% ========================================================================
+%  TORQUE RATE LIMITER
+% =========================================================================
+
+function newCommand = ...
+    applyRateLimit(previousCommand, desiredCommand, P)
+
+difference = ...
+    desiredCommand - previousCommand;
+
+
+if difference >= 0
+
+    maximumChange = ...
+        P.torqueRateIncrease * P.dt;
+
+else
+
+    maximumChange = ...
+        P.torqueRateDecrease * P.dt;
+
+end
+
+
+if abs(difference) <= maximumChange
+
+    newCommand = desiredCommand;
+
+else
+
+    newCommand = ...
+        previousCommand + ...
+        sign(difference) * maximumChange;
+
+end
+
+
+newCommand = ...
+    max(0, newCommand);
+
 end
