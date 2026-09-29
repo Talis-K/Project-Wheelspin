@@ -12,7 +12,7 @@
 %       Tyre force
 %
 % The simulation runs continuously while the UI is open.
-% Switching TCS OFF pauses the simulation.
+% Switching the simulation OFF pauses the simulation; the TCS toggle independently enables or disables traction-control intervention. The brake button applies negative torque until the vehicle stops.
 
 clear;
 clc;
@@ -23,6 +23,17 @@ close all;
 % =========================================================================
 
 app = TCS_UI;
+
+% Brake button: one press requests braking. The request is automatically
+% cleared when the vehicle reaches a stop.
+if isprop(app.BrakesButton, 'UserData')
+    app.BrakesButton.UserData = false;
+end
+
+if isprop(app.BrakesButton, 'ButtonPushedFcn')
+    app.BrakesButton.ButtonPushedFcn = ...
+        @(src, event) set(src, 'UserData', true);
+end
 
 
 %% ========================================================================
@@ -99,7 +110,18 @@ P.muDry = 1.0;
 
 P.muLow = 0.35;
 
-P.targetSlip = 0.12;
+P.muIce = 0.2; %Frosted Road
+
+P.targetSlip = 0.12;          % Peak traction slip target
+
+% Slip at which the simplified tyre model produces maximum force.
+% Keep this equal to targetSlip so TCS aims at the peak of the curve.
+P.peakSlip = P.targetSlip;
+
+% Residual sliding-force fraction after the peak.
+% This prevents the simplified tyre from unrealistically losing almost
+% all longitudinal force at very large slip.
+P.highSlipForceRatio = 0.01; % 1% force at extreme slip (slip = 2)
 
 P.activationSlip = 0.13;
 
@@ -112,7 +134,7 @@ P.minimumSlipSpeed = 0.5;
 %  CONTROLLER PARAMETERS
 % =========================================================================
 
-P.slipFilterTime = 0.020;
+P.slipFilterTime = 0.005;
 
 P.Kp = 500;
 
@@ -168,6 +190,9 @@ P.driverTorqueGain = P.motorPeakTorque;
 
 P.launchTorqueCap = 160;
 
+% Simple braking torque used by app.BrakesButton [Nm].
+P.brakeTorque = P.motorPeakTorque;
+
 
 %% ========================================================================
 %  LIVE PLOT SETUP
@@ -179,12 +204,12 @@ plotFigure = figure( ...
     'Color', 'w', ...
     'Position', [80 80 1100 700]);
 
-tiledlayout(plotFigure, 2, 2);
+tiledlayout(plotFigure, 4, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
 
 
 %% Vehicle speed ----------------------------------------------------------
 
-axSpeed = nexttile;
+axSpeed = nexttile(1, [1 2]);
 
 speedLine = plot( ...
     axSpeed, ...
@@ -204,9 +229,29 @@ xlim(axSpeed, [0 P.historyTime]);
 ylim(axSpeed, [0 100]);
 
 
+%% Wheel speed ------------------------------------------------------------
+
+axWheelSpeed = nexttile(5, [1 2]);
+
+wheelSpeedLine = plot( ...
+    axWheelSpeed, ...
+    nan, ...
+    nan, ...
+    'LineWidth', 1.5);
+
+grid(axWheelSpeed, 'on');
+
+xlabel(axWheelSpeed, 'Time [s]');
+ylabel(axWheelSpeed, 'Wheel Speed [km/h]');
+
+title(axWheelSpeed, 'Driven Wheel Speed');
+
+xlim(axWheelSpeed, [0 P.historyTime]);
+
+
 %% Slip -------------------------------------------------------------------
 
-axSlip = nexttile;
+axSlip = nexttile(3, [4 2]);
 
 slipLine = plot( ...
     axSlip, ...
@@ -240,7 +285,7 @@ xlim(axSlip, [0 P.historyTime]);
 
 %% Motor torque -----------------------------------------------------------
 
-axTorque = nexttile;
+axTorque = nexttile(9, [1 2]);
 
 torqueLine = plot( ...
     axTorque, ...
@@ -274,7 +319,7 @@ xlim(axTorque, [0 P.historyTime]);
 
 %% Tyre force -------------------------------------------------------------
 
-axForce = nexttile;
+axForce = nexttile(13, [1 2]);
 
 forceLine = plot( ...
     axForce, ...
@@ -316,6 +361,10 @@ state.desiredMemory = 0;
 
 state.activeMemory = false;
 
+% Brake request from app.BrakesButton.
+% The button latches the brake request until the vehicle reaches a stop.
+state.brakeActive = false;
+
 state.currentTime = 0;
 
 state.stepCount = 0;
@@ -336,6 +385,8 @@ state.filterAlpha = ...
 historyTime = nan(P.historySteps, 1);
 
 historySpeed = nan(P.historySteps, 1);
+
+historyWheelSpeed = nan(P.historySteps, 1);
 
 historySlip = nan(P.historySteps, 1);
 
@@ -380,28 +431,26 @@ while isvalid(app.UIFigure)
 
     pedal = app.AccelerationsliderSlider.Value / 100;
 
+    % Read the TCS enable/disable toggle.
+    tcsEnabled = strcmp(app.TCSControl.Value, 'On');
+
+    % Read the latched brake request.
+    brakeActive = false;
+    if isprop(app.BrakesButton, 'UserData')
+        brakeActive = logical(app.BrakesButton.UserData);
+    end
+
 
     %% --------------------------------------------------------------------
     %  Road friction
     % ---------------------------------------------------------------------
-    %
-    % Keep the existing low-friction road event:
-    %
-    %   0 - 2.2 s       Dry road
-    %   2.2 - 3.0 s     Low friction
-    %   > 3.0 s         Dry road
-    %
+    % Change for Demo
 
-    if state.currentTime >= 2.2 && ...
-            state.currentTime < 3.0
+      roadMu = P.muDry; 
+      % roadMu = P.muLow;
+     % roadMu = P.muIce;
 
-        roadMu = P.muLow;
-
-    else
-
-        roadMu = P.muDry;
-
-    end
+        
 
 
     %% --------------------------------------------------------------------
@@ -413,6 +462,8 @@ while isvalid(app.UIFigure)
         state, ...
         pedal, ...
         roadMu, ...
+        tcsEnabled, ...
+        brakeActive, ...
         P);
 
 
@@ -425,6 +476,10 @@ while isvalid(app.UIFigure)
 
     state.stepCount = ...
         state.stepCount + 1;
+
+    if ~state.brakeActive && isprop(app.BrakesButton, 'UserData')
+        app.BrakesButton.UserData = false;
+    end
 
 
     %% --------------------------------------------------------------------
@@ -444,6 +499,9 @@ while isvalid(app.UIFigure)
 
         historySpeed(1:end-1) = ...
             historySpeed(2:end);
+
+        historyWheelSpeed(1:end-1) = ...
+            historyWheelSpeed(2:end);
 
         historySlip(1:end-1) = ...
             historySlip(2:end);
@@ -465,7 +523,10 @@ while isvalid(app.UIFigure)
     historyTime(index) = state.currentTime;
 
     historySpeed(index) = ...
-        state.vehicleSpeed * 3.6;
+        state.vehicleSpeed * 3.6; % Convert to km/h
+
+    historyWheelSpeed(index) = ...
+        state.wheelSpeed * P.wheelRadius * 3.6; % Wheel road speed [km/h]
 
     historySlip(index) = output.slip;
 
@@ -491,6 +552,8 @@ while isvalid(app.UIFigure)
 
         speedPlot = historySpeed(valid);
 
+        wheelSpeedPlot = historyWheelSpeed(valid);
+
         slipPlot = historySlip(valid);
 
         torquePlot = historyTorque(valid);
@@ -508,6 +571,14 @@ while isvalid(app.UIFigure)
             speedLine, ...
             'XData', tPlot, ...
             'YData', speedPlot);
+
+
+        %% Wheel speed
+
+        set( ...
+            wheelSpeedLine, ...
+            'XData', tPlot, ...
+            'YData', wheelSpeedPlot);
 
 
         %% Slip
@@ -564,6 +635,8 @@ while isvalid(app.UIFigure)
 
         xlim(axSpeed, [xStart xEnd]);
 
+        xlim(axWheelSpeed, [xStart xEnd]);
+
         xlim(axSlip, [xStart xEnd]);
 
         xlim(axTorque, [xStart xEnd]);
@@ -573,11 +646,11 @@ while isvalid(app.UIFigure)
 
         %% Gauge
 
-        speedKmh = ...
+        speedKmh = ... 
             state.vehicleSpeed * 3.6;
 
-        app.Gauge.Value = ...
-            min(max(speedKmh, 0), 100);
+        app.WheelSpeedGauge.Value = ...
+            min(max(speedKmh, 0), 250);
 
 
         %% Update UI
@@ -610,7 +683,12 @@ end
 % =========================================================================
 
 function [state, output] = ...
-    simulateVehicleStep(state, pedal, roadMu, P)
+    simulateVehicleStep(state, pedal, roadMu, tcsEnabled, brakeActive, P)
+
+% Keep the brake request latched in the simulation state.
+% This prevents the button request from becoming a one-step pulse.
+state.brakeActive = brakeActive;
+
 
 % -------------------------------------------------------------------------
 % Motor speed
@@ -682,12 +760,17 @@ if controllerUpdate
 
 
     % ---------------------------------------------------------------------
-    % Very low accelerator input
+    % TCS OFF
     % ---------------------------------------------------------------------
+    %
+    % When TCS is disabled, the controller does not intervene.
+    % The requested motor torque is passed through unchanged apart from
+    % the normal motor torque limit and torque rate limiter.
+    %
 
-    if pedal < 0.02
+    if ~tcsEnabled
 
-        desiredTorque = 0;
+        desiredTorque = requestedTorque;
 
         state.integratorMemory = 0;
 
@@ -695,66 +778,92 @@ if controllerUpdate
 
 
     % ---------------------------------------------------------------------
-    % Low-speed launch limitation
+    % TCS ON
     % ---------------------------------------------------------------------
-
-    elseif state.vehicleSpeed < P.lowSpeedThreshold
-
-        desiredTorque = ...
-            min(requestedTorque, P.launchTorqueCap);
-
-        state.integratorMemory = 0;
-
-        state.activeMemory = false;
-
-
-    % ---------------------------------------------------------------------
-    % TCS control
-    % ---------------------------------------------------------------------
-
-    elseif filteredSlip > P.activationSlip
-
-        state.activeMemory = true;
-
-        slipError = ...
-            filteredSlip - P.targetSlip;
-
-        state.integratorMemory = ...
-            state.integratorMemory + ...
-            slipError * ...
-            P.controllerSampleTime;
-
-        % Anti-windup
-
-        state.integratorMemory = ...
-            max( ...
-            min(state.integratorMemory, 0.25), ...
-            -0.25);
-
-
-        % PI torque correction
-
-        torqueCorrection = ...
-            P.Kp * slipError + ...
-            P.Ki * state.integratorMemory;
-
-
-        desiredTorque = ...
-            requestedTorque - torqueCorrection;
-
 
     else
 
-        % Below activation threshold.
+        % -------------------------------------------------------------
+        % Very low accelerator input
+        % -------------------------------------------------------------
 
-        state.activeMemory = false;
+        if pedal < 0.02
 
-        % Gradually release the integrator.
+            desiredTorque = 0;
 
-        state.integratorMemory = ...
-            0.95 * state.integratorMemory;
+            state.integratorMemory = 0;
 
-        desiredTorque = requestedTorque;
+            state.activeMemory = false;
+
+
+        % -------------------------------------------------------------
+        % Launch torque limitation: TCS remains active from launch.
+        elseif state.vehicleSpeed < P.lowSpeedThreshold
+
+            requestedTorque = min(requestedTorque, P.launchTorqueCap);
+
+            if filteredSlip > P.activationSlip
+                state.activeMemory = true;
+                slipError = filteredSlip - P.targetSlip;
+                state.integratorMemory = state.integratorMemory + ...
+                    slipError * P.controllerSampleTime;
+                state.integratorMemory = max(min(state.integratorMemory, 0.25), -0.25);
+                torqueCorrection = P.Kp * slipError + ...
+                    P.Ki * state.integratorMemory;
+                desiredTorque = requestedTorque - torqueCorrection;
+            else
+                state.activeMemory = false;
+                state.integratorMemory = 0.95 * state.integratorMemory;
+                desiredTorque = requestedTorque;
+            end
+
+        % TCS control
+
+        elseif filteredSlip > P.activationSlip
+
+            state.activeMemory = true;
+
+            slipError = ...
+                filteredSlip - P.targetSlip;
+
+            state.integratorMemory = ...
+                state.integratorMemory + ...
+                slipError * ...
+                P.controllerSampleTime;
+
+            % Anti-windup
+
+            state.integratorMemory = ...
+                max( ...
+                min(state.integratorMemory, 0.25), ...
+                -0.25);
+
+
+            % PI torque correction
+
+            torqueCorrection = ...
+                P.Kp * slipError + ...
+                P.Ki * state.integratorMemory;
+
+
+            desiredTorque = ...
+                requestedTorque - torqueCorrection;
+
+
+        else
+
+            % Below activation threshold.
+
+            state.activeMemory = false;
+
+            % Gradually release the integrator.
+
+            state.integratorMemory = ...
+                0.95 * state.integratorMemory;
+
+            desiredTorque = requestedTorque;
+
+        end
 
     end
 
@@ -766,6 +875,21 @@ if controllerUpdate
 
 
     state.desiredTorque = desiredTorque;
+
+end
+
+
+% -------------------------------------------------------------------------
+% Brake override
+% -------------------------------------------------------------------------
+%
+% Braking requests negative drivetrain torque. The tyre model below still
+% limits the resulting braking force according to road friction and slip.
+%
+
+if brakeActive
+
+    state.desiredTorque = -P.brakeTorque;
 
 end
 
@@ -819,7 +943,8 @@ state.motorTorque = ...
 % -------------------------------------------------------------------------
 
 state.motorTorque = ...
-    max(0, state.motorTorque);
+    max(-P.brakeTorque, ...
+    min(P.motorPeakTorque, state.motorTorque));
 
 
 % -------------------------------------------------------------------------
@@ -845,8 +970,11 @@ totalResistingForce = ...
     aerodynamicDrag + rollingForce;
 
 
+% The simulated wheel represents one half of the driven rear axle.
+vehicleDriveForce = 2 * tyreForce;
+
 vehicleAcceleration = ...
-    (tyreForce - totalResistingForce) / ...
+    (vehicleDriveForce - totalResistingForce) / ...
     P.mass;
 
 
@@ -877,6 +1005,25 @@ state.wheelSpeed = ...
 
 state.vehicleSpeed = ...
     max(0, state.vehicleSpeed);
+
+
+% -------------------------------------------------------------------------
+% Brake stop / semi-reset
+% -------------------------------------------------------------------------
+
+if brakeActive && state.vehicleSpeed <= 0.01
+
+    state.vehicleSpeed = 0;
+    state.wheelSpeed = 0;
+    state.motorTorque = 0;
+    state.torqueCommand = 0;
+    state.desiredTorque = 0;
+    state.integratorMemory = 0;
+    state.filteredSlipMemory = 0;
+    state.activeMemory = false;
+    state.brakeActive = false;
+
+end
 
 
 % -------------------------------------------------------------------------
@@ -1010,16 +1157,60 @@ slip = ...
 
 
 % -------------------------------------------------------------------------
-% Simple tyre friction model
+% Peak-slip tyre friction model
 % -------------------------------------------------------------------------
 
-% The tyre force increases approximately linearly with slip until the
-% available friction limit is reached.
+% Low-fidelity tyre characteristic:
+%   - zero force at zero slip
+%   - force rises smoothly to a maximum at +/- P.peakSlip
+%   - force falls after the peak, but approaches a residual sliding-force
+%     level instead of collapsing toward zero
+%
+% This gives the TCS a meaningful peak to target while avoiding the
+% unrealistic "almost no force at huge slip" behaviour of the previous
+% exponential model.
+
+slipMagnitude = abs(slip);
+
+if slipMagnitude <= P.peakSlip
+
+    % Smooth rise from zero to maximum at peak slip.
+    forceFactor = ...
+        sin((pi/2) * slipMagnitude / max(P.peakSlip, eps));
+
+else
+
+    % Gradual fall from the peak toward almost zero tractive force.
+    % At slip = 2, retain only 1% of the peak tyre force.
+    % This represents extreme wheelspin where essentially no useful
+    % longitudinal force is transferred to the vehicle.
+    excessSlip = ...
+        slipMagnitude - P.peakSlip;
+
+    slipRange = ...
+        max(2 - P.peakSlip, eps);
+
+    decay = ...
+        exp(-log(100) * excessSlip / slipRange);
+
+    forceFactor = ...
+        max(0.01, decay);
+
+end
+
+if slipMagnitude >= 2
+
+    % Extreme wheelspin: approximately 1% of peak tractive force.
+    forceFactor = 0.01;
+
+
+end
+
+tyreForceMagnitude = ...
+    roadMu * P.drivenWheelLoad * forceFactor;
 
 tyreForceIdeal = ...
-    P.drivenWheelLoad * ...
-    roadMu * ...
-    tanh(8 * max(slip, 0));
+    sign(slip) * tyreForceMagnitude;
 
 
 % -------------------------------------------------------------------------
@@ -1029,15 +1220,9 @@ tyreForceIdeal = ...
 maximumTyreForce = ...
     roadMu * P.drivenWheelLoad;
 
-
 tyreForce = ...
-    min(tyreForceIdeal, maximumTyreForce);
-
-
-% Prevent negative driving force.
-
-tyreForce = ...
-    max(0, tyreForce);
+    max(-maximumTyreForce, ...
+    min(tyreForceIdeal, maximumTyreForce));
 
 
 % -------------------------------------------------------------------------
@@ -1050,7 +1235,6 @@ aerodynamicDrag = ...
     P.frontalArea * ...
     P.dragCoefficient * ...
     vehicleSpeed^2;
-
 
 % -------------------------------------------------------------------------
 % Rolling resistance
@@ -1112,6 +1296,7 @@ end
 
 
 newCommand = ...
-    max(0, newCommand);
+    max(-P.brakeTorque, ...
+    min(P.motorPeakTorque, newCommand));
 
 end
