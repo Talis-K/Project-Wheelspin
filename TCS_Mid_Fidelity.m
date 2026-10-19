@@ -191,7 +191,7 @@ P.driverTorqueGain = P.motorPeakTorque;
 P.launchTorqueCap = 160;
 
 % Simple braking torque used by app.BrakesButton [Nm].
-P.brakeTorque = P.motorPeakTorque;
+P.brakeTorque = 1000;
 
 
 %% ========================================================================
@@ -446,8 +446,8 @@ while isvalid(app.UIFigure)
     % ---------------------------------------------------------------------
     % Change for Demo
 
-      roadMu = P.muDry; 
-      % roadMu = P.muLow;
+      % roadMu = P.muDry; 
+        roadMu = P.muLow;
      % roadMu = P.muIce;
 
         
